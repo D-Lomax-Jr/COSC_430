@@ -1,0 +1,103 @@
+#!/usr/bin/perl
+#
+#  cpkg: a prototype "C with packages" to C translator
+#
+#   This tool is the "package" side of an experimental
+#   "C with go-style interfaces" to C translator.
+#
+#   It translates a single F.pkg "C+Package" source file
+#   to the corresponding F.c file. Each %func-marked
+#   function generates a signature-check flag variable.
+#
+#  (C) August 2018, Duncan C. White (adapted)
+#
+
+use strict;
+use warnings;
+use 5.010;
+use Data::Dumper;
+use Getopt::Long;
+use Function::Parameters;
+use FindBin qw($Bin);
+
+use lib "$Bin";
+use Support;
+use Sig;
+
+my $package;       # name of current package
+my %isfunc;        # set of all functions in the package
+
+#
+# my $error = checkfunc( $funcname );
+#   Check whether function $funcname is already defined - if so, return
+#   a sensible error message, otherwise return undef. Also marks the
+#   function as defined..
+#
+fun checkfunc( $funcname )
+{
+    return "function $funcname already defined" if $isfunc{$funcname}++;
+    return undef;
+}
+
+#
+# my $text = handle_line( $line );
+#   Handle $line, returning any text (in plain C format) that should go
+#   straight into the .c file.
+#
+fun handle_line( $line )
+{
+    return $line unless $line =~ /^%/;    # copy non-% lines
+
+    if( $line =~ s/^(\s*)%func\s*// )     # found %func?
+    {
+        my( $ok, $info ) = parse_func_line( $line, \&checkfunc );
+        fatal( $line, $info ) unless $ok;
+
+        my $funcname = $info->{FUNCNAME};
+        my $rettype  = $info->{RETURNTYPE};
+        my $origline = $info->{ORIGLINE};
+        my $params   = $info->{PARAMS};
+        my $sig      = makesig( $rettype, @$params );
+
+        print "debug: found func $origline with sig $sig\n";
+
+        my $name = $funcname;
+        $name =~ s/^${package}_//;    # remove the package name
+        my $sigvar = "${package}_${name}_${sig}";
+
+        my $text = "char $sigvar;\t// $funcname signature variable:\n".
+                   "$origline\t// $funcname function:\n";
+        return $text;
+    }
+    fatal( $line, "Unhandled % line" );
+}
+
+# ------------------ main ----------------------
+
+die "Usage: cpkg filename\n" unless @ARGV == 1;
+
+my $inputfilename = shift;
+my $basename = $inputfilename;
+$basename =~ s/\.pkg$//;
+my $cfilename = "$basename.c";
+
+$package = $basename;
+
+openfile( $inputfilename ) || die "cpkg: can't open $inputfilename\n";
+
+unlink( $cfilename );
+
+my $text = "";        # generated .c file contents
+while( defined( $_ = nextline() ) )
+{
+    $text .= handle_line( $_ );
+}
+
+# add the "useflagvars" flag.
+$text .= "\nchar ${package}_useflagvars;          // check the existence of the flag variables\n";
+
+open( my $cfh, '>', $cfilename ) || die "cpkg: can't create $cfilename\n";
+print $cfh $text;
+close( $cfh );
+
+exit 0;

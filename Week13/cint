@@ -1,0 +1,255 @@
+#!/usr/bin/perl
+#
+#  cint: a prototype "C with interfaces" to C translator..
+#
+#   This tool contains an experimental "C with go-style interfaces"
+#   to C translator. It takes a single F.interface file and generates
+#   F.h and F.c implementing an interface of function pointers and a
+#   bind function.
+#
+#  (C) August 2018, Duncan C. White (adapted)
+#
+
+use strict;
+use warnings;
+use 5.010;
+use Data::Dumper;
+use Getopt::Long;
+use Function::Parameters;
+use FindBin qw($Bin);
+
+use lib "$Bin";
+use Support;
+use Sig;
+
+my $interface;      # name of current interface
+my %isfunc;         # set of all marked functions in the interface
+my @func;           # the marked functions in the order we saw them
+my @structfield;    # the structure fields
+my %seensig;        # the set of signatures we've already seen
+my %funcsig;        # function -> signature mapping
+
+#
+# my $error = checkfunc( $funcname );
+#   Check whether function $funcname is already defined - if so, return
+#   a sensible error message, otherwise return undef. Also marks the
+#   function as defined..
+#
+fun checkfunc( $funcname )
+{
+    return "function $funcname already defined" if $isfunc{$funcname}++;
+    return undef;
+}
+
+#
+# my $text = handle_line( $line );
+#   Handle $line, modifying @structfield and %seensig, returning any
+#   text (in plain C format) that should go straight into the .h file.
+#
+fun handle_line( $line )
+{
+    return $line unless $line =~ /^%/;    # copy non-% lines
+
+    if( $line =~ s/^(\s*)%func\s*// )     # found %func?
+    {
+        my $origindent = $1;
+        my( $ok, $info ) = parse_func_line( $line, \&checkfunc );
+        fatal( $line, $info ) unless $ok;
+
+        my $funcname = $info->{FUNCNAME};
+        my $rettype  = $info->{RETURNTYPE};
+        my $origline = $info->{ORIGLINE};
+        my $params   = $info->{PARAMS};
+
+        print "debug: found func $origline\n";
+
+        my $sig      = makesig( $rettype, @$params );
+        my $typename = "${interface}_${sig}_f";
+
+        print "debug: found func $origline with sig $sig\n";
+
+        my $htext = "";
+        unless( $seensig{$sig}++ )
+        {
+            my $args = join( ', ', map {
+                s/\w+$//;    # remove the parameter name
+                $_;
+            } @$params );
+            $args = "void" unless $args;
+            $htext = "typedef $rettype (*$typename)( $args );\n";
+        }
+        push @structfield, "$typename $funcname;";
+        push @func, $funcname;
+        $funcsig{$funcname} = $sig;
+
+        return $htext;
+    }
+    fatal( $line, "Unhandled % line" );
+}
+
+#
+# my $text = makestruct( $interface, @structfield );
+#   Generate the structure type for the interface..
+#
+fun makestruct( $interface, @structfield )
+{
+    my $struct = "typedef struct\n{\n";
+    $struct .= join( '', map { s/^/\t/; "$_\n" } @structfield );
+    $struct .= qq(} $interface;\n);
+
+    my $str = qq(
+// This represents the "interface $interface" at run-time.
+// It's a container of SLOTS for the $interface functions..
+$struct
+);
+    return $str;
+}
+
+#
+# my $str = makebind( $extern, $interface );
+#   Generate the bind function definition or declaration for the
+#   current interface
+#
+fun makebind( $extern, $interface )
+{
+    my $str = qq[
+/*
+ * $interface *in = ${interface}_bind( char *module, char *errmsg );
+ *  Attempt to "bind" lib<module>.so to the $interface interface:
+ *  Load "lib<module>.so" into memory, and attempt to locate all the
+ *  required function symbols inside the library. For each function
+ *  called <fname>, we look first for a symbol "fname", then if that fails,
+ *  for a symbol "module_fname".
+ *
+ *  If we fail to find even one of the required functions: strcpy
+ *  an error message into errmsg and return NULL
+ *
+ *  If we succeed then we say we have "bound" the module to the interface:
+ *  we return an newly malloc()d $interface object with the slot function
+ *  pointers bound to the corresponding functions in lib<module>.so
+ */
+$extern$interface *${interface}_bind( char *module, char *errmsg )];
+    return $str;
+}
+
+#
+# my $str = c_preamble( $interface );
+#   Produce the preamble for the .c file, for $interface.
+#   This mainly comprises the headers etc.
+#
+fun c_preamble( $interface )
+{
+    my $str = qq(#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#include <dlfcn.h>
+
+#include "$interface.h"
+#include "lookup.h"
+
+
+);
+    return $str;
+}
+
+#
+# my $str = makebindbody( $interface );
+#   Construct the body of the bind function for $interface.
+#   (Also uses @func and %funcsig)
+#
+fun makebindbody( $interface )
+{
+    my $top = qq({
+    char libname[1024];
+    assert( strlen(module) < 1000 );
+    sprintf( libname, "lib%s.so", module );
+    void *dl = dlopen( libname, RTLD_NOW );
+    if( dl == NULL )
+    {
+        sprintf( errmsg, "${interface}_bind: dlopen of %s failed", libname );
+        return NULL;
+    }
+
+    ${interface} *in = malloc(sizeof(*in));
+    if( in == NULL )
+    {
+        strcpy( errmsg, "${interface}_bind: malloc() failed" );
+        return NULL;
+    }
+
+    pkg_info   info;
+    info.dl        = dl;
+    info.module    = module;
+    info.interface = "$interface";
+    info.libname   = libname;
+    info.errmsg    = errmsg;
+);
+
+    my $middle = "";
+
+    foreach my $f (@func)
+    {
+        my $sig = $funcsig{$f};
+        $middle .= qq(
+    in->$f = (${interface}_${sig}_f) lookup_function( &info, "$f", "${f}_${sig}" );
+    if( in->$f == NULL )
+    {
+        free(in);
+        return NULL;
+    }
+);
+    }
+
+    my $bottom = qq(
+    return in;
+}
+);
+
+    return $top . $middle . $bottom;
+}
+
+# ------------------ main ----------------------
+
+die "Usage: cint filename\n" unless @ARGV == 1;
+
+my $inputfilename = shift;
+$interface = $inputfilename;
+$interface =~ s/\.interface$//;
+my $cfilename = "$interface.c";
+my $hfilename = "$interface.h";
+
+openfile( $inputfilename ) || die "cint: can't open $inputfilename\n";
+
+unlink( $cfilename );
+unlink( $hfilename );
+
+my $htext = "";        # generated .h file contents
+while( defined( $_ = nextline() ) )
+{
+    $htext .= handle_line( $_ );
+}
+
+# make the struct definition for the interface..
+$htext .= makestruct( $interface, @structfield );
+
+# make the bind heading for the interface..
+$htext .= makebind( "extern ", $interface ).";\n";
+
+# build the .h file
+open( my $hfh, '>', $hfilename ) || die "cint: can't create $hfilename\n";
+print $hfh $htext;
+close( $hfh );
+
+# Now generate the .c file
+my $ctext = "";
+
+$ctext .= c_preamble( $interface );
+$ctext .= makebind( "", $interface )."\n";
+$ctext .= makebindbody( $interface );
+
+open( my $cfh, '>', $cfilename ) || die "cint: can't create $cfilename\n";
+print $cfh $ctext;
+close( $cfh );
+
+exit 0;

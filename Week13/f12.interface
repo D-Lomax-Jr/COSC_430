@@ -1,0 +1,2 @@
+%func void f1(void);
+%func int  f2(void);
